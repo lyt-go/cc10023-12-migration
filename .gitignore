@@ -94,6 +94,8 @@ desktop.ini
 *.db
 *.pid
 *.seed
+# 预测数据迁移工作区（Parquet 分区、归档索引、迁移回执）
+backend/var/
 
 # BEGIN S11 LOCAL SNAPSHOT EXCLUSIONS
 **/.git/**

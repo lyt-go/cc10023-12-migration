@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.prediction_archive import PredictionArchive
 from app.store import store
 
 
@@ -16,6 +17,9 @@ class DataExportService(BaseModuleService):
     STATUS_ORDER = ["草稿", "导出中", "已完成", "已失败"]
     ACTION_RULES = {"开始导出": "导出中", "确认完成": "已完成", "标记失败": "已失败"}
     NEGATIVE_ACTIONS = []
+
+    def __init__(self, archive: PredictionArchive | None = None) -> None:
+        self.archive = archive or PredictionArchive()
 
     def export_feature_dataset(self, task_id: int, output_format: str = "csv") -> dict[str, Any]:
         """将特征数据集导出为指定格式并写入外部存储路径。"""
@@ -41,6 +45,65 @@ class DataExportService(BaseModuleService):
         task["pending"] = False
         return {"ok": True, "task_id": task_id, "format": "parquet",
                 "compression": "snappy", "path": f"exports/{task_id}/data.snappy.parquet"}
+
+    def read_prediction_partition(self, task_id: int) -> dict[str, Any]:
+        """回读导出任务对应的列式预测分区，供下游业务核对字段。"""
+        task = store.find(self.MODULE, task_id)
+        if task is None:
+            return {"ok": False, "message": f"导出任务 {task_id} 不存在"}
+        dataset = str(task.get("数据来源") or "")
+        partitions = self._prediction_partitions(dataset)
+        paths = task.get("partition_paths")
+        if isinstance(paths, list) and paths:
+            # 只回读登记这张导出任务的那几个文件，避免把后来新增的日期算进来。
+            wanted = set(paths)
+            partitions = {
+                dt: part for dt, part in partitions.items()
+                if str(part.get("path")) in wanted
+            }
+        if not partitions:
+            return {
+                "ok": False,
+                "task_id": task_id,
+                "dataset": dataset,
+                "format": task.get("导出格式"),
+                "message": "该导出任务没有可回读的列式预测分区",
+            }
+        files: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
+        field_mapping = task.get("字段映射")
+        for dt in sorted(partitions):
+            part = partitions[dt]
+            path = self.archive.root / str(part["path"])
+            if not path.exists():
+                return {"ok": False, "task_id": task_id, "dataset": dataset,
+                        "message": f"{dt} 分区文件丢失：{part['path']}"}
+            partition_rows = self.archive.read_partition_file(path)
+            files.append({
+                "dt": dt,
+                "data_date": part.get("data_date", dt),
+                "path": str(part["path"]),
+                "rows": len(partition_rows),
+                "compression": part.get("compression", "snappy"),
+            })
+            rows.extend(partition_rows)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "dataset": dataset,
+            "format": "parquet",
+            "compression": "snappy",
+            "field_mapping": field_mapping,
+            "parts": files,
+            "row_count": len(rows),
+            "rows": rows,
+        }
+
+    def _prediction_partitions(self, dataset: str) -> dict[str, dict[str, Any]]:
+        """数据导出管理只暴露已切换成列式存储的日期，CSV 回退日期不在此列。"""
+        if not dataset:
+            return {}
+        return dict(self.archive.archive_index(dataset).get("partitions") or {})
 
     def archive_export_to_storage(self, task_id: int) -> dict[str, Any]:
         """将完成的导出任务归档到长期存储，保留历史版本供回溯。"""

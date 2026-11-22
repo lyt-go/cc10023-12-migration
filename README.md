@@ -77,5 +77,40 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 存量预测 CSV → Parquet 迁移
+
+批量预测任务的历史产物是字段映射为 `prediction_id,model_id,score,label,dt`
+的 CSV。`backend/app/services/prediction_archive.py` 负责按 `dt` 把它们迁移成
+Snappy 压缩的列式分区，并提供统一的按日期读入口：
+
+- `model_id` 按字符串存储，`001` 回读仍是 `001`；`score` 用
+  `decimal128(38,18)` 保存，回读为十进制字符串；空 `label` 存成 NULL。
+- 每个数据日期是一套完整输入。`daily` 模式逐日切换，`batch` 模式整批成功
+  才切换；失败日期继续读原始 CSV，坏行用 CSV 物理行号定位。
+- 迁移回执（`receipts/<dataset>/<migration_id>.json`）记录源行数、模型标识、
+  分区去向和失败行；`verify` 会回读分区核对行数、Snappy 压缩、内容摘要与
+  归档索引（`archive/index.json`）里的 `data_date`。
+- 同一日期重复迁移是原子覆盖，索引提交前读入口始终指向旧数据，所以中断后
+  恢复不会重复或丢行；迁移成功会在数据导出管理登记可回读的列式分区文件。
+
+数据默认落在 `backend/var/predictions/`（已加入 `.gitignore`），可用
+`PREDICTION_DATA_ROOT` 指向共享存储。依赖版本见 `backend/requirements.txt`
+（`pyarrow==21.0.0`）。
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /api/predict_batch/{id}/migration` | 执行迁移，参数 `source_csv`、`mode`、`dates`、`field_mapping` |
+| `GET /api/predict_batch/{id}/migration/receipt` | 读取迁移回执（默认最近一次） |
+| `GET /api/predict_batch/{id}/migration/verify` | 按回执核对源行数、模型标识、分区去向 |
+| `GET /api/predict_batch/{id}/predictions?dt=YYYY-MM-DD` | 按日期回读，已切换读 Parquet，否则读 CSV |
+| `GET /api/predict_batch/{id}/archive-index` | 数据日期与当前生效存储位置的对应关系 |
+| `GET /api/predict_batch/{id}/export/{export_id}/read` | 回读数据导出管理登记的列式分区 |
+
+```bash
+cd backend
+.venv/bin/uvicorn app.main:app --port 8000     # 启动
+.venv/bin/python tests/test_prediction_migration.py
+```
+
 领域：数据工程
 子方向：数据分析与数据应用
